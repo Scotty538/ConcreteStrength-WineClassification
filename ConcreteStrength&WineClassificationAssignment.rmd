@@ -1,0 +1,458 @@
+---
+title: "161.324 Data Mining"
+subtitle: "Assignment 2, 2024"
+author: "Scott O'Connor"
+output: html_document
+---
+
+```{r setup, echo=TRUE, warning=FALSE, message=FALSE}
+# Add any other packages you need to load here.
+library(tidyverse)
+library(skimr)
+library(naniar)
+library(GGally)
+library(VIM)
+library(randomForest)
+library(rsample)
+library(yardstick)
+library(nnet)
+library(parsnip)
+library(discrim)
+library(tidykda)
+library(naivebayes)
+library(recipes)
+library(kknn)
+step <- stats::step # override recipes::step() with stats::step()
+library(rpart)
+library("rpart.plot")
+
+# Read in the data
+concrete.train <- read_csv("https://www.massey.ac.nz/~jcmarsha/161324/assessment/data/concrete-train.csv")
+concrete.test  <- read_csv("https://www.massey.ac.nz/~jcmarsha/161324/assessment/data/concrete-test.csv")
+
+red.train <- read_csv("https://www.massey.ac.nz/~jcmarsha/161324/assessment/data/red-train.csv") |>
+  mutate(Quality = as_factor(Quality))
+red.test  <- read_csv("https://www.massey.ac.nz/~jcmarsha/161324/assessment/data/red-test.csv")
+```
+
+## Exercise 1: Predicting Concrete Strength
+
+Let's begin by taking a look at the data to check the missingness.
+
+```{r}
+skim(concrete.train)
+skim(concrete.test)
+vis_miss(concrete.train) # 
+```
+
+```{r, fig.height=12, fig.width=12}
+ggpairs(concrete.train)
+```
+<br />Don't seem to be any significant linear relationships :(\
+<br />And Strength isn't correlated to any variable. Oh oh.\
+
+<br />What's going on with the Strength variable? There appear to be 2 or 3 outliers. Let's take a closer look.\
+
+```{r}
+concrete.train |> ggplot() + 
+  aes(x = Strength) + 
+  geom_histogram()
+
+concrete.train |> ggplot() + 
+  aes(x = Strength) + 
+  geom_boxplot()
+```
+<br />Let's take a look at them
+```{r}
+concrete.train |> filter(Strength > 500) 
+```
+<br />Wow, 3 out of 827 are 1,000x higher than the rest. 
+<br />Something is not right. I'm gonna filter out these values and look at the distribution of Strength.
+
+```{r}
+concrete.train |> filter(Strength < 500) |> 
+  ggplot() + 
+  aes(x = Strength) + 
+  geom_histogram()
+
+concrete.train |> filter(Strength < 500) |> 
+  ggplot() + 
+  aes(x = Strength) + 
+  geom_boxplot()
+```
+<br />That looks reasonable. How about the new scatterplot matrix?
+
+```{r}
+no_outliers <- concrete.train |> filter(Strength < 500)
+
+ggpairs(no_outliers)
+```
+
+<br />Much better. Now have some correlation between Strength, Cement, Superp and Age.
+<br />Are the missing values still missing?
+
+```{r}
+skimr::skim(no_outliers)
+naniar::vis_miss(no_outliers)
+
+```
+<br />Odd that the same values are missing for both variables.
+
+<br />Let's look and see is there is a pattern to the missingness.
+```{r}
+no_outliers |> 
+  ggplot() +
+  aes(x = Cement, y = Strength) +
+  geom_miss_point()
+
+no_outliers |> 
+  ggplot() +
+  aes(x = Superp, y = Strength) +
+  geom_miss_point()
+```
+
+<br />Seems to be MCAR.
+
+<br />However, these variables are the best predictors of Strength. In addition, there is not much correlation 
+<br />between Cement and Superp and the other variables so I am not sure if imputing would be effective.
+
+<br />Given the above, I'm going to just delete all the missing values.
+
+```{r}
+complete <- complete.cases(no_outliers)
+
+deleted_na <- no_outliers |> filter(complete)
+skim(deleted_na)
+vis_miss(deleted_na)
+```
+<br />Right, no more missing values! Let's have another look at the scatterplot plot matrix
+
+```{r, fig.height=12, fig.width=12}
+ggpairs(deleted_na)
+```
+
+<br />Doesn't look like any variables need transforming.
+<br />Not many linear relationships, so linear regression will likely struggle.
+
+<br />Now that we have clean data, let's split it so we can effectively validate the accuracy of our models
+
+```{r}
+set.seed(1234)
+split1 <- initial_split(deleted_na, prop=3/4)
+split1
+con_train1 <- training(split1)
+con_test1  <- testing(split1)
+```
+
+<br />Okay, let's get a general ballpark figure for the RMSE using the mean value of Strength. 
+<br />All our models should be significantly better than this number.
+
+```{r}
+lm.mean.ballpark <- lm(Strength ~ 1, data = con_train1)
+
+lm_mean_ballaprk_pred <- augment(lm.mean.ballpark, newdata = con_test1) |> select(Strength, .fitted, everything())
+
+lm_mean_ballaprk_pred |> rmse(truth = Strength, estimate = .fitted)
+
+```
+<br />Okay. Using mean value of Strength produces a RMSE of 16.91 (this matches the std dev of Strength which is 16.71)
+Hopefully all our predictions are much better than this.
+
+<br />Let's save time and use parsnip and run several models at once and see which is most accurate.
+To ensure we don't lose precision when exponentiating in our neural net, let's step-normalise in a recipe, 
+bake both training and test sets, then run all three models. We will run these models a few times with
+different seeds to split the data but the same seed for the model training in order to identify
+the best model. We will then tune the models using fixed seeds, and then check this tuning is consistent
+when run with a number of different seeds.
+
+
+```{r}
+set.seed(119)
+split <- initial_split(deleted_na, prop=3/4)
+split
+con_train <- training(split)
+con_test  <- testing(split)
+
+
+concrete_base <- recipe(Strength ~ ., data = con_train)
+concrete_rec <- concrete_base |> step_normalize(all_numeric_predictors())
+concrete_prep <- concrete_rec |> prep(con_train)
+concrete_train_baked <- concrete_prep |> bake(con_train)
+concrete_test_baked <- concrete_prep |> bake(con_test)
+
+set.seed(1119)
+spec.lm <- linear_reg(mode = "regression", engine = "lm")
+spec.rf <- rand_forest(mode = "regression", engine = "randomForest", mtry = 6, min_n = 3)
+spec.nn <- mlp(mode = "regression", engine = "nnet", hidden_units = 6, penalty = 0.01, epochs = 500)
+spec.neighbour <- nearest_neighbor(mode ="regression", neighbors = 3)
+
+#set.seed(119) 
+fit.lm <- spec.lm |> fit(Strength ~ ., data = concrete_train_baked)
+fit.rf <- spec.rf |> fit(Strength ~ ., data = concrete_train_baked)
+fit.nn <- spec.nn |> fit(Strength ~ ., data = concrete_train_baked)
+fit.neighbour <- spec.neighbour |> fit(Strength ~ ., data = concrete_train_baked)
+
+# Check we're reaching convergence for the mlp:
+fit.nn |>
+  extract_fit_engine() |>
+  pluck("convergence")
+
+pred.lm <- con_test |> bind_cols(fit.lm |> predict(concrete_test_baked))
+pred.rf <- con_test |> bind_cols(fit.rf |> predict(concrete_test_baked))
+pred.nn <- con_test |> bind_cols(fit.nn |> predict(concrete_test_baked))
+pred.neighbour <- con_test |> bind_cols(fit.neighbour |> predict(concrete_test_baked))
+
+                                 
+pred <- bind_rows(lst(pred.lm, pred.rf, pred.nn, pred.neighbour), .id = "model")
+
+pred |>  ggplot() +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(aes(x=.pred, y = Strength), alpha = 0.3) +
+  facet_wrap(vars(model), ncol=1)
+
+
+pred |> group_by(model) |> 
+  metrics(truth = Strength, .pred) |> 
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+<br />Random Forest consistently comes out on top!
+<br />Lowest RMSE was 4.72 with mtry = 6, min_n = 3.
+
+<br />Does AIC prefer particular variables?
+```{r}
+con_lm <- lm(Strength ~ ., data = concrete_train_baked)
+stats::step(con_lm)
+```
+<br />No predictors were removed by AIC.
+
+<br />Now we retrain the random forest model using all the training data and make our predictions on the provided test set.
+
+```{r}
+concrete_base_final <- recipe(Strength ~ ., data = deleted_na)
+concrete_rec_final <- concrete_base_final |> step_normalize(all_numeric_predictors())
+concrete_prep_final <- concrete_rec_final |> prep(deleted_na)
+concrete_train_baked_final <- concrete_prep_final |> bake(deleted_na)
+concrete_test_baked_final <- concrete_prep_final |> bake(concrete.test)
+
+spec.rf.final <- rand_forest(mode = "regression", engine = "randomForest", mtry = 6, min_n = 3)
+
+fit.rf.final <- spec.rf.final |> fit(Strength ~ ., data = concrete_train_baked_final)
+
+concrete.test.with.predictions <- concrete.test |> bind_cols(fit.rf.final |> predict(concrete_test_baked_final))
+
+write_csv(concrete.test.with.predictions, "ex1_96028881.csv")
+```
+
+<br />Let's check the distributions of of the training and test predictions
+```{r}
+all <- bind_rows(list(predict = concrete.test.with.predictions |> rename(Strength = .pred), train = deleted_na), .id = 'data')
+
+all |> ggplot() +
+  aes(x = Strength, col = data) +
+  geom_density()
+
+all |> ggplot() +
+  aes(x = Strength, col = data) +
+  geom_histogram() +
+  facet_wrap(vars(data), ncol = 1, scales = 'free_y')
+```
+<br />Distributions look similar so hopefully the predictions are accurate.
+
+### 1.1 Concrete Strength Methodology
+
+Exploratory analysis revealed that 0.5% of the data was missing. This comprised of 18 observations from both Cement and Superp. A scatter plot matrix revealed little correlation between predictor variables as well as three outliers (x1000 fold higher than the median) in the target variable. After removing these outliers, an improved correlation between Strength and Cement, Superp and Age was observed. The 17 remaining missing observations in both Cement and Superp appeared to be missing completely at random,  however, given these two variables are most associated with the target variable, and there is only weak correlation between the predictor variables, imputing was deemed not to be effective. As a result, the missing values were simply deleted. New scatter plots showed that data transformation was not necessary. Unfortunately, there did not appear to be any strong linear relationships between Strength and any of the predictor variables, so linear regression will likely struggle. The training data was then split into training and validation sets in order to effectively validate the accuracy of predictive models. The standard deviation of the target variable (16.71) is the ballpark RMSE that the models should definitely improve on. To save time and effort, the parsnip package was used to find the most accurate model. To ensure precision wasn’t lost when exponentiating in the neural net, all predictor variables were step-normalized in a recipe. To ensure a fair comparison, all models used baked training data, and the validation data was also baked with the same recipe. All models were run several times, with a number of different seeds used to split the original training data, in order to identify the best performing model. The neural net was checked to ensure convergence while AIC was also conducted to examine whether the linear model could be simplified, but no predictors were excluded. Overall, the random forest model consistently produced the best RMSE score and so this model was then tuned, again using a number of different seeds to split the original training data to ensure the model would generalize well. The lowest average RMSE obtained from the tuned random forest model was approximately 5.0 with the number of random predictors set at 6 and a minimum node size of 3. The model was then retrained using all the original training data (baked) and our final predictions were made using the provided test set (also baked). For peace of mind, the distribution of the target variable was compared between the training data and the test data and found to be quite similar. Hopefully the predictions are accurate.
+
+
+## Exercise 2: Predicting quality of red wine
+
+<br />Let's begin by taking a look at the data:
+
+```{r}
+skim(red.train)
+skim(red.test)
+vis_miss(red.train)
+vis_miss(red.test)
+```
+<br />Yahoo, nothing missing! Training data and test data seem to have very similar distributions for each variable.
+FreeSO2 and TotalSO2 have very large std deviations. Let's take a look at scatter plots to
+see if they have some outliers.
+
+```{r, fig.height = 12, fig.width=12}
+ggpairs(red.train,aes(col=Quality))
+```
+
+<br />Let's have a closer look.
+
+```{r}
+red.train |>
+  pivot_longer(-c(Quality)) |>
+  ggplot() +
+  geom_density(aes(x=value, col=Quality)) +
+  facet_wrap(vars(name), scales='free')
+
+```
+
+<br />Removing the high TotalSO2 value has virtually no effect on std dev, and given there is an equally high value in the test data, I will retain the observation.
+
+Looking at the distributions of the variables, there doesn't seem to be much difference in group means, likely LDA will struggle.
+Looks to be some weak relationships between variables so NB may struggle.
+Looking at color ggpairs, density is very similar so KDA will likely struggle too.
+Hmmm. Let's just try them all the models and hope something works reasonably well.
+
+<br />Let's combine all models in parsnip for easy comparison
+```{r}
+set.seed(9999)
+splitred <- initial_split(red.train, prop=3/4)
+red_training <- training(splitred)
+red_testing  <- testing(splitred)
+
+
+red_prep <- recipe(Quality ~ ., data=red_training) |> step_normalize(all_numeric_predictors()) |> prep(red_training)
+red_training_baked <- red_prep |> bake(red_training)
+red_testing_baked <- red_prep |> bake(red_testing)
+
+
+#LDA
+red_lda <- discrim_linear() |> fit(Quality ~ ., data = red_training_baked)
+red_lda_pred <- red_lda |> augment(new_data = red_testing_baked)
+
+#KDA
+red_kda <- discrim_kernel() |> fit(Quality ~ Alcohol + Citric + Acidvol, data = red_training_baked)
+red_kda_pred <- red_kda |> augment(new_data = red_testing_baked)
+
+# Naive Bayes
+red_training_nb <- naive_Bayes(engine="naivebayes") |> fit(Quality ~ ., data = red_training_baked)
+red_nb_pred <- red_training_nb |> augment(new_data=red_testing_baked)
+
+# Logistic regression
+red_glm <- logistic_reg() |> fit(Quality ~ ., data = red_training_baked)
+red_glm.pred <- red_glm |> augment(new_data = red_testing_baked)
+
+# No point changing threshold because need to maximize correctness.
+# No point using multinominal regression because target variable only has 2 categories.
+
+# K Nearest Neighbours, k = 1
+red.knn1 <- nearest_neighbor(mode = "classification", neighbors = 1) |> fit(Quality ~ ., data = red_training_baked)
+red.knn1.pred <- red.knn1 |> augment(new_data = red_testing_baked)
+# K Nearest Neighbours, k = 17
+red.knn17 <- nearest_neighbor(mode = "classification", neighbors = 17) |> fit(Quality ~ ., data = red_training_baked)
+red.knn17.pred <- red.knn17 |> augment(new_data = red_testing_baked)
+
+# Decision Tree
+red_rp <- decision_tree(mode="classification", min_n = 3) |> fit(Quality ~ ., data = red_training_baked)
+red.rp.pred <- red_rp |> augment(new_data = red_testing_baked)
+
+# Random Forest
+red_rf <- rand_forest(mode="classification", engine = "randomForest", mtry = 5, min_n = 5, trees = 500) |> fit(Quality ~ ., data = red_training_baked)
+red.rf.pred <- red_rf |> augment(new_data = red_testing_baked)
+
+# Neural net
+red_mlp <- mlp(mode="classification", hidden_units = 8, penalty = 0.69, epochs = 500) |> fit(Quality ~ ., data = red_training_baked)
+# check convergence:
+red_mlp |> pluck('fit', 'convergence') # 0, so it has converged.
+red.mlp.pred <- red_mlp |> augment(new_data = red_testing_baked)
+
+
+predictions <- bind_rows(lst(red_lda_pred, red_kda_pred, red_nb_pred, red_glm.pred, red.knn1.pred, red.knn17.pred, red.rp.pred, red.rf.pred, red.mlp.pred), .id = "model")
+
+predictions |> group_by(model) |> 
+  accuracy(truth=Quality, estimate=.pred_class) |> 
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+<br />Random forest (mtry = 5, min_n = 5) was consistently the best performing model with accuracy regularly over 80%.
+
+<br />Can we simplify the logistic regression model?
+```{r}
+red_glm2 <- glm(Quality ~ ., family = binomial, data = red_training_baked)
+step(red_glm2)
+```
+
+<br />AIC recommends: Acidvol + Chlorides + FreeSO2 + TotalSO2 + Sulphates + Alcohol. Does this improve the predictions?
+
+```{r}
+red_glm.predsimple <- logistic_reg() |> fit(Quality ~ Acidvol + Chlorides + FreeSO2 + TotalSO2 + Sulphates + Alcohol, data = red_training_baked) |> augment(new_data = red_testing_baked)
+
+red_glm.predsimple
+
+red_glm.predsimple |> conf_mat(truth = Quality, estimate = .pred_class)
+red_glm.predsimple |> accuracy(truth=Quality, estimate=.pred_class)
+
+```
+
+<br />Similar result.
+
+
+<br />Let's use the random forest model to retrain the model using all the training data and make our predictions on the provided test set.
+
+```{r}
+red_rf_final <- rand_forest(mode="classification", engine = "randomForest", mtry = 5, min_n = 5, trees = 500) |> fit(Quality ~ ., data = red.train)
+red.test.with.classifications <- red_rf_final |> augment(new_data = red.test)
+
+write_csv(red.test.with.classifications, "ex2_96028881.csv")
+```
+
+<br />Let's check the distributions of the training and test predictions for each variable
+```{r}
+
+red.train |>
+  pivot_longer(-c(Quality)) |>
+  ggplot() +
+  geom_density(aes(x=value, col=Quality)) +
+  facet_wrap(vars(name), scales='free')
+
+
+red.test.with.classifications |>  select(-c(.pred_Fail, .pred_Pass)) |> rename(Quality = .pred_class) |>
+  pivot_longer(-c(Quality)) |>
+  ggplot() +
+  geom_density(aes(x=value, col=Quality)) +
+  facet_wrap(vars(name), scales='free')
+
+```
+```{r}
+red.test.with.classifications |> group_by(.pred_class) |> summarise(Proportion = n()/399)
+```
+<br />Same proportion of passes as the training set.
+
+### 2.1 Red wine quality methodology
+
+Exploratory analysis revealed that no data was missing and that the training and test data sets had very similar distributions for each variable. FreeSO2 and TotalSO2 both had very large std deviations, but the scatter plot matrix and the distribution of whether the wine passed or failed for each variable revealed mostly normal distributions. A high TotalSO2 value was identified but removing it had virtually no effect on std deviation, and given there was an equally high value in the test data, the data point was retained. A similar distribution of passing and failing for each of the variables indicated that there wasn’t much difference in group means, so LDA was not expected to excel. Similarly, there also looked to be some weak association between variables, and density levels seemed to be very similar so neither NB nor KDA were expected to outperform. The scatter plots indicated that data transformation was not necessary. The training data was then split into training and validation sets in order to effectively validate the accuracy of predictive models. The proportion of passing wines in the data set was 54% which indicates balance between the categories. To save time and effort, the parsnip package was used to find the most accurate model. The trialed models were LDA, KDA, NB, logistic regression (multinominal regression wasn’t attempted because the target variable only had 2 categories), K nearest neighbor, a decision tree, random forest, and a neural net. For the KDA model, the three variables which gave the best separation of pass/fail were selected. Density plots found these to be Alcohol, Citric, Acidvol. Basically, every model was run using the same methodology as described in the previous answer in order to identify the best performing model. The neural net was checked to ensure convergence while AIC was also conducted on the logistic regression to examine whether the linear model could be simplified. AIC recommended a simpler model comprising of Acidvol, Chlorides, FreeSO2, TotalSO2, Sulphates and Alcohol, however, the predictive ability was lower than the more complex model, so the more complex model was retained. Similarly, there was no point trying to change the predictive threshold because the goal was to maximize correctness. The consistently best performing model was the random forest model so this model was then tuned as before to ensure the model would generalize well. The best average accuracy of this tuned random forest model was just over 80% with the number of random predictors set at 5 and a minimum node size of also 5. The model was then retrained using all the original training data (it wasn’t baked this time as I realized that normalization shouldn’t have any effect except for a neural net) and our final predictions were made using the provided test set (not baked either). For peace of mind, the distributions of passing and failing wines for each variable were plotted for the training and test data sets and found to be reasonably similar. The proportion of passes and failures were also the same in the training and test data sets. Hopefully the predictions are accurate.
+
+### 2.2 Red wine quality conclusions
+
+The most important factor in determining if a wine passes the quality assessment is the alcohol content. This was determined by examining a decision tree of the training set. In a very quick and dirty nutshell, if the alcohol content is larger than or equal to 10, then the wine passes. If more complexity is desired, the other factors that also contribute to determining if a wine passes the quality assessment are Sulphate, Acidfix and FreeSO2. To briefly summarise the more complex decision tree shown below, if alcohol content is less than 11 and FreeSO2 is less than 7.5, then the wine fails. The wine will also fail if alcohol content is below 10 and Sulphate is below 0.58, or if alcohol content is below 10, Sulphate is above or equal to 0.58 and Acidfix is less than 10.
+
+
+```{r}
+rf_model2 <- rpart(Quality ~., data = red.train)
+plotcp(rf_model2)
+```
+<br />Little increase in accuracy is achieved after the first split.
+
+```{r}
+rf_model_overlysimple <- rpart(Quality ~., data = red.train, cp = 0.05)
+prp(rf_model_overlysimple)
+```
+<br />However, if we wish to produce the smallest **optimal tree**, we need to do a little pruning.
+```{r}
+cptable  <- printcp(rf_model2)
+cptable |> as_tibble() |> mutate(limit = min(xerror + xstd)) |> filter(xerror <= limit)
+```
+```{r}
+rf_model_simplified <- rpart(Quality ~., data = red.train, cp = 0.015)
+prp(rf_model_simplified)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
